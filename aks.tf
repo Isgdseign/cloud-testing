@@ -13,14 +13,14 @@ resource azurerm_kubernetes_cluster "k8s_cluster" {
   }
   addon_profile {
     oms_agent {
-      enabled = false
+      enabled = true
     }
     kube_dashboard {
-      enabled = true
+      enabled = false
     }
   }
   role_based_access_control {
-    enabled = false
+    enabled = true
   }
   tags = {
     git_commit           = "898d5beaec7ffdef6df0d7abecff407362e2a74e"
