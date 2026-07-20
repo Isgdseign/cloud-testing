@@ -8,11 +8,10 @@ variable "region" {
 }
 
 variable "db_username" {
-  default = "kai_monkey_user_ob6RGj"
 }
 
 variable "db_password" {
-  default = "kHJ!4dusp7A#Xf21URhhZ1#"
+  sensitive = true
 }
 
 variable "default_tags" {
