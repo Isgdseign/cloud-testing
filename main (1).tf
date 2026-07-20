@@ -212,14 +212,6 @@ resource "aws_security_group" "db_sg" {
     description     = "PostgreSQL from app security group"
   }
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all egress"
-  }
-
   tags = { Name = "db-security-group" }
 }
 
@@ -301,6 +293,8 @@ resource "aws_iam_instance_profile" "app_instance_profile" {
   role = aws_iam_role.ec2_role.name
 }
 
+data "aws_caller_identity" "current" {}
+
 # ECS task execution role – pull images, retrieve secrets, write logs
 resource "aws_iam_role" "ecs_execution_role" {
   name               = "${var.project_name}-ecs-execution-role"
@@ -343,7 +337,7 @@ resource "aws_iam_role_policy" "ecs_execution_policy" {
           "ecr:BatchGetImage",
           "ecr:GetDownloadUrlForLayer"
         ]
-        Resource = "*"
+        Resource = "arn:aws:ecr:${var.aws_region}:${data.aws_caller_identity.current.account_id}:repository/${var.project_name}"
       }
     ]
   })
@@ -425,6 +419,33 @@ resource "aws_db_instance" "app_database" {
 }
 
 # -----------------------------------------------------------------------------
+# SSM Parameters for DB connection details (no sensitive data in user_data)
+# -----------------------------------------------------------------------------
+resource "aws_ssm_parameter" "db_host" {
+  name  = "/${var.project_name}/${var.environment}/DB_HOST"
+  type  = "SecureString"
+  value = aws_db_instance.app_database.address
+}
+
+resource "aws_ssm_parameter" "db_port" {
+  name  = "/${var.project_name}/${var.environment}/DB_PORT"
+  type  = "SecureString"
+  value = "5432"
+}
+
+resource "aws_ssm_parameter" "db_name" {
+  name  = "/${var.project_name}/${var.environment}/DB_NAME"
+  type  = "SecureString"
+  value = "appdatabase"
+}
+
+resource "aws_ssm_parameter" "db_user" {
+  name  = "/${var.project_name}/${var.environment}/DB_USER"
+  type  = "SecureString"
+  value = "dbadmin"
+}
+
+# -----------------------------------------------------------------------------
 # EC2 – secure user_data, IMDSv2, encrypted root, no secrets in code
 # -----------------------------------------------------------------------------
 data "aws_ami" "ubuntu" {
@@ -450,21 +471,26 @@ resource "aws_instance" "app_server" {
   key_name               = var.ssh_key_name
   iam_instance_profile   = aws_iam_instance_profile.app_instance_profile.name
 
-  # ✅ user_data retrieves DB password from SSM at runtime – no hardcoded secret
-  user_data = <<-EOF
+  # ✅ user_data retrieves ALL DB connection details from SSM at runtime – no hardcoded secrets
+  user_data = sensitive(<<-EOF
               #!/bin/bash
               apt-get update
               apt-get install -y docker.io awscli
+              DB_HOST=$(aws ssm get-parameter --name "/${var.project_name}/${var.environment}/DB_HOST" --with-decryption --query "Parameter.Value" --output text --region ${var.aws_region})
+              DB_PORT=$(aws ssm get-parameter --name "/${var.project_name}/${var.environment}/DB_PORT" --with-decryption --query "Parameter.Value" --output text --region ${var.aws_region})
+              DB_NAME=$(aws ssm get-parameter --name "/${var.project_name}/${var.environment}/DB_NAME" --with-decryption --query "Parameter.Value" --output text --region ${var.aws_region})
+              DB_USER=$(aws ssm get-parameter --name "/${var.project_name}/${var.environment}/DB_USER" --with-decryption --query "Parameter.Value" --output text --region ${var.aws_region})
               DB_PASSWORD=$(aws ssm get-parameter --name "/${var.project_name}/${var.environment}/DB_PASSWORD" --with-decryption --query "Parameter.Value" --output text --region ${var.aws_region})
               docker run -d \
-                -e DB_HOST="${aws_db_instance.app_database.address}" \
-                -e DB_PORT="5432" \
-                -e DB_NAME="appdatabase" \
-                -e DB_USER="dbadmin" \
+                -e DB_HOST="$DB_HOST" \
+                -e DB_PORT="$DB_PORT" \
+                -e DB_NAME="$DB_NAME" \
+                -e DB_USER="$DB_USER" \
                 -e DB_PASSWORD="$DB_PASSWORD" \
                 -p 8080:8080 \
                 ${var.app_image}
               EOF
+  )
 
   metadata_options {
     http_tokens   = "required"
@@ -585,7 +611,7 @@ resource "aws_subnet" "public_a" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "${var.aws_region}a"
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = false
   tags = { Name = "public-subnet-a", Type = "Public" }
 }
 
@@ -593,7 +619,7 @@ resource "aws_subnet" "public_b" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.2.0/24"
   availability_zone       = "${var.aws_region}b"
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = false
   tags = { Name = "public-subnet-b", Type = "Public" }
 }
 
