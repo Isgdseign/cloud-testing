@@ -13,7 +13,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket         = "gravia-terraform-state-prod"   # ⚠️ Enable versioning manually on this bucket!
+    bucket         = "gravia-terraform-state-prod"
     key            = "infrastructure/terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true
@@ -30,6 +30,66 @@ provider "aws" {
       ManagedBy   = "terraform"
     }
   }
+}
+
+# -----------------------------------------------------------------------------
+# Terraform State Bucket – provisioned with versioning, encryption, and policy
+# -----------------------------------------------------------------------------
+resource "aws_s3_bucket" "terraform_state" {
+  bucket        = "gravia-terraform-state-prod"
+  force_destroy = false
+
+  tags = { Name = "terraform-state-bucket" }
+}
+
+resource "aws_s3_bucket_versioning" "terraform_state_versioning" {
+  bucket = aws_s3_bucket.terraform_state.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "terraform_state_encryption" {
+  bucket = aws_s3_bucket.terraform_state.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "terraform_state_pab" {
+  bucket                  = aws_s3_bucket.terraform_state.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_policy" "terraform_state_policy" {
+  bucket = aws_s3_bucket.terraform_state.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "RequireTLS"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource  = [
+          aws_s3_bucket.terraform_state.arn,
+          "${aws_s3_bucket.terraform_state.arn}/*"
+        ]
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "false"
+          }
+        }
+      }
+    ]
+  })
 }
 
 # -----------------------------------------------------------------------------
@@ -89,6 +149,16 @@ resource "aws_s3_bucket_versioning" "app_data_versioning" {
   }
 }
 
+resource "aws_s3_bucket_server_side_encryption_configuration" "app_data_encryption" {
+  bucket = aws_s3_bucket.app_data.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
 # -----------------------------------------------------------------------------
 # Security Group – restricted ingress, least-privilege egress
 # -----------------------------------------------------------------------------
@@ -127,28 +197,168 @@ resource "aws_security_group" "app_sg" {
 }
 
 # -----------------------------------------------------------------------------
-# IAM Role – trusted only by specific services, least-privilege policy
+# Security Group for RDS – only allows ingress on 5432 from app_sg
 # -----------------------------------------------------------------------------
-data "aws_iam_policy_document" "assume_role" {
+resource "aws_security_group" "db_sg" {
+  name_prefix = "${var.project_name}-db-sg-"
+  vpc_id      = aws_vpc.main.id
+  description = "Database security group"
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app_sg.id]
+    description     = "PostgreSQL from app security group"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all egress"
+  }
+
+  tags = { Name = "db-security-group" }
+}
+
+# -----------------------------------------------------------------------------
+# IAM Roles – separate roles for each service (least privilege)
+# -----------------------------------------------------------------------------
+data "aws_iam_policy_document" "assume_role_ec2" {
   statement {
     actions = ["sts:AssumeRole"]
     effect  = "Allow"
     principals {
       type        = "Service"
-      identifiers = ["ec2.amazonaws.com", "ecs-tasks.amazonaws.com"]
+      identifiers = ["ec2.amazonaws.com"]
     }
   }
 }
 
-resource "aws_iam_role" "app_role" {
-  name               = "${var.project_name}-app-role"
-  assume_role_policy = data.aws_iam_policy_document.assume_role.json
-  tags = { Name = "app-role" }
+data "aws_iam_policy_document" "assume_role_ecs" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    effect  = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
 }
 
-resource "aws_iam_role_policy" "app_policy" {
-  name = "${var.project_name}-app-policy"
-  role = aws_iam_role.app_role.id
+data "aws_iam_policy_document" "assume_role_eks" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    effect  = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["eks.amazonaws.com"]
+    }
+  }
+}
+
+# EC2 instance role – SSM access for DB password retrieval
+resource "aws_iam_role" "ec2_role" {
+  name               = "${var.project_name}-ec2-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_role_ec2.json
+  tags = { Name = "ec2-role" }
+}
+
+resource "aws_iam_role_policy" "ec2_policy" {
+  name = "${var.project_name}-ec2-policy"
+  role = aws_iam_role.ec2_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters"
+        ]
+        Resource = aws_ssm_parameter.db_password.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.app_data.arn,
+          "${aws_s3_bucket.app_data.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "app_instance_profile" {
+  name = "${var.project_name}-instance-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+# ECS task execution role – pull images, retrieve secrets, write logs
+resource "aws_iam_role" "ecs_execution_role" {
+  name               = "${var.project_name}-ecs-execution-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_role_ecs.json
+  tags = { Name = "ecs-execution-role" }
+}
+
+resource "aws_iam_role_policy" "ecs_execution_policy" {
+  name = "${var.project_name}-ecs-execution-policy"
+  role = aws_iam_role.ecs_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = aws_secretsmanager_secret.app_secrets.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameters"
+        ]
+        Resource = aws_ssm_parameter.db_password.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.app_logs.arn}:*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# ECS task runtime role – application-specific permissions only
+resource "aws_iam_role" "ecs_task_role" {
+  name               = "${var.project_name}-ecs-task-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_role_ecs.json
+  tags = { Name = "ecs-task-role" }
+}
+
+resource "aws_iam_role_policy" "ecs_task_policy" {
+  name = "${var.project_name}-ecs-task-policy"
+  role = aws_iam_role.ecs_task_role.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -166,6 +376,18 @@ resource "aws_iam_role_policy" "app_policy" {
       }
     ]
   })
+}
+
+# EKS cluster role – dedicated role with AmazonEKSClusterPolicy
+resource "aws_iam_role" "eks_role" {
+  name               = "${var.project_name}-eks-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_role_eks.json
+  tags = { Name = "eks-role" }
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  role       = aws_iam_role.eks_role.name
+  policy_arn  = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
 
 # -----------------------------------------------------------------------------
@@ -193,7 +415,7 @@ resource "aws_db_instance" "app_database" {
   deletion_protection    = var.environment == "prod" ? true : false
   multi_az               = true
 
-  vpc_security_group_ids = [aws_security_group.app_sg.id]
+  vpc_security_group_ids = [aws_security_group.db_sg.id]
   db_subnet_group_name   = aws_db_subnet_group.app_db_subnet.name
 
   skip_final_snapshot        = false
@@ -222,10 +444,11 @@ data "aws_ami" "ubuntu" {
 resource "aws_instance" "app_server" {
   ami           = data.aws_ami.ubuntu.id
   instance_type = "t3.medium"
-  subnet_id     = aws_subnet.public_a.id
+  subnet_id     = aws_subnet.private_a.id
 
   vpc_security_group_ids = [aws_security_group.app_sg.id]
   key_name               = var.ssh_key_name
+  iam_instance_profile   = aws_iam_instance_profile.app_instance_profile.name
 
   # ✅ user_data retrieves DB password from SSM at runtime – no hardcoded secret
   user_data = <<-EOF
@@ -266,8 +489,8 @@ resource "aws_ecs_task_definition" "app_task" {
   requires_compatibilities = ["FARGATE"]
   cpu                      = "512"
   memory                   = "1024"
-  execution_role_arn       = aws_iam_role.app_role.arn
-  task_role_arn            = aws_iam_role.app_role.arn
+  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_task_role.arn
 
   container_definitions = jsonencode([
     {
@@ -318,7 +541,7 @@ resource "aws_ecs_task_definition" "app_task" {
 # -----------------------------------------------------------------------------
 resource "aws_eks_cluster" "app_cluster" {
   name     = "${var.project_name}-${var.environment}-cluster"
-  role_arn = aws_iam_role.app_role.arn
+  role_arn = aws_iam_role.eks_role.arn
 
   vpc_config {
     subnet_ids = [
@@ -344,7 +567,7 @@ resource "aws_eks_cluster" "app_cluster" {
     "scheduler"
   ]
 
-  depends_on = [aws_iam_role_policy.app_policy]
+  depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
   tags = { Name = "app-eks-cluster" }
 }
 
@@ -393,6 +616,19 @@ resource "aws_internet_gateway" "main" {
   tags = { Name = "${var.project_name}-igw" }
 }
 
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags = { Name = "${var.project_name}-nat-eip" }
+}
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public_a.id
+  tags = { Name = "${var.project_name}-nat-gw" }
+
+  depends_on = [aws_internet_gateway.main]
+}
+
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
   route {
@@ -400,6 +636,15 @@ resource "aws_route_table" "public" {
     gateway_id = aws_internet_gateway.main.id
   }
   tags = { Name = "public-route-table" }
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id
+  }
+  tags = { Name = "private-route-table" }
 }
 
 resource "aws_route_table_association" "public_a" {
@@ -412,15 +657,37 @@ resource "aws_route_table_association" "public_b" {
   route_table_id = aws_route_table.public.id
 }
 
+resource "aws_route_table_association" "private_a" {
+  subnet_id      = aws_subnet.private_a.id
+  route_table_id = aws_route_table.private.id
+}
+
+resource "aws_route_table_association" "private_b" {
+  subnet_id      = aws_subnet.private_b.id
+  route_table_id = aws_route_table.private.id
+}
+
 resource "aws_db_subnet_group" "app_db_subnet" {
   name       = "${var.project_name}-db-subnet"
   subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
   tags = { Name = "DB subnet group" }
 }
 
+# -----------------------------------------------------------------------------
+# KMS Key for CloudWatch Log Group encryption
+# -----------------------------------------------------------------------------
+resource "aws_kms_key" "log_key" {
+  description             = "KMS key for CloudWatch Log Group encryption"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+
+  tags = { Name = "cloudwatch-log-key" }
+}
+
 resource "aws_cloudwatch_log_group" "app_logs" {
   name              = "/ecs/${var.project_name}-app"
   retention_in_days = 30
+  kms_key_id        = aws_kms_key.log_key.arn
 }
 
 # -----------------------------------------------------------------------------
